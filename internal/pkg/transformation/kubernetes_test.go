@@ -636,55 +636,52 @@ func TestPodDRAInfo(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		deviceToUUID map[string]string
-		migDevices   map[string]*DRAMigDeviceInfo
-		wantUUIDs    []string
-		isMIG        bool
+		name      string
+		uuid      string
+		mig       *DRAMigDeviceInfo
+		wantUUIDs []string
+		isMIG     bool
 	}{
 		{
-			name:         "uuid-exists",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    []string{"GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
-			isMIG:        false,
+			name:      "uuid-exists",
+			uuid:      "GPU-8a748984-0fe7-297f-916c-4b998ce202d1",
+			wantUUIDs: []string{"GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
 		},
 		{
-			name:         "uuid-updated",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "GPU-UUID-Updated"},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    []string{"GPU-UUID-Updated"},
-			isMIG:        false,
+			name:      "uuid-updated",
+			uuid:      "GPU-UUID-Updated",
+			wantUUIDs: []string{"GPU-UUID-Updated"},
 		},
 		{
-			name:         "no-uuid",
-			deviceToUUID: map[string]string{},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    nil,
-			isMIG:        false,
+			name:      "no-uuid",
+			uuid:      "",
+			wantUUIDs: nil,
 		},
 		{
-			name:         "mig-device",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "MIG-12345"},
-			migDevices: map[string]*DRAMigDeviceInfo{
-				"poolA/gpu-x": {
-					MIGDeviceUUID: "MIG-12345",
-					Profile:       "1g.12gb",
-					ParentUUID:    "GPU-parent-uuid",
-				},
+			name: "mig-device",
+			uuid: "GPU-parent-uuid",
+			mig: &DRAMigDeviceInfo{
+				MIGDeviceUUID: "MIG-12345",
+				Profile:       "1g.12gb",
+				ParentUUID:    "GPU-parent-uuid",
 			},
-			wantUUIDs: []string{"GPU-parent-uuid"}, // Should map to parent UUID
+			wantUUIDs: []string{"GPU-parent-uuid"},
 			isMIG:     true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Inject a stub lookup. This mirrors what the real v1/v1beta1
+			// Lister-backed lookups return for a single (pool, device) tuple.
 			draMgr := &DRAResourceSliceManager{
-				deviceToUUID: tc.deviceToUUID,
-				migDevices:   tc.migDevices,
+				lookup: func(pool, device string) (string, *DRAMigDeviceInfo) {
+					if pool == "poolA" && device == "gpu-x" {
+						return tc.uuid, tc.mig
+					}
+					return "", nil
+				},
 			}
-
 			pm := &PodMapper{
 				Config:               &appconfig.Config{NvidiaResourceNames: []string{appconfig.NvidiaResourceName}},
 				ResourceSliceManager: draMgr,
@@ -701,7 +698,10 @@ func TestPodDRAInfo(t *testing.T) {
 				}},
 			}
 
-			got := pm.toDeviceToPodsDRA(resp)
+			// deviceInfo is nil here: the existing cases don't exercise the
+			// MIG path. NVML lookup is skipped when deviceInfo is nil,
+			// so the function falls back to parent-UUID-only mapping
+			got := pm.toDeviceToPodsDRA(resp, nil)
 
 			assert.Len(t, got, len(tc.wantUUIDs), "map size")
 			for _, want := range tc.wantUUIDs {

@@ -322,7 +322,7 @@ func (p *PodMapper) getMappings(deviceInfo deviceinfo.Provider) (map[string][]Po
 	}
 
 	if p.Config.KubernetesEnableDRA {
-		deviceToPodsDRA = p.toDeviceToPodsDRA(pods)
+		deviceToPodsDRA = p.toDeviceToPodsDRA(pods, deviceInfo)
 	}
 
 	return deviceToPods, deviceToPod, deviceToPodsDRA, nil
@@ -570,12 +570,12 @@ func stripVGPUSuffix(deviceID string) string {
 	return deviceID
 }
 
-func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourcesResponse) map[string][]PodInfo {
+func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourcesResponse, deviceInfo deviceinfo.Provider) map[string][]PodInfo {
 	deviceToPodsMap := make(map[string][]PodInfo)
 
 	slog.Debug("Processing pod dynamic resources", "totalPods", len(devicePods.GetPodResources()))
 	// Track pod+namespace+container combinations per device
-	// UUID -> "podName/namespace/containerName" -> bool
+	// draMappingKey -> "podName/namespace/containerName" -> bool
 	processedPods := make(map[string]map[string]bool)
 
 	for _, pod := range devicePods.GetPodResources() {
@@ -603,18 +603,21 @@ func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourc
 							continue
 						}
 
-						// Create unique key for pod+namespace+container combination
+						// Build the set of DRA mapping keys under which this
+						// pod/container must be discoverable. DCGM emits
+						// MIG-instance metrics keyed by "<gpuIndex>-<gpuInstanceID>"
+						// (see Metric.GetIDOfType), so for MIG claims we
+						// additionally register the GPU-instance identifier in
+						// addition to the parent UUID. Without this, per-MIG
+						// metrics never receive pod attributes.
+						draMappingKeys := []string{mappingKey}
+						if migInfo != nil {
+							if giID := p.draMIGGPUInstanceIdentifier(migInfo, deviceInfo); giID != "" {
+								draMappingKeys = append(draMappingKeys, giID)
+							}
+						}
+
 						podContainerKey := podName + "/" + podNamespace + "/" + cntName
-
-						// Initialize tracker for this device if needed
-						if processedPods[mappingKey] == nil {
-							processedPods[mappingKey] = make(map[string]bool)
-						}
-
-						// Skip if we already processed this pod+container for this device
-						if processedPods[mappingKey][podContainerKey] {
-							continue
-						}
 
 						podInfo := p.createPodInfo(pod, container)
 						drInfo := DynamicResourceInfo{
@@ -628,6 +631,7 @@ func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourc
 							drInfo.MIGInfo = migInfo
 							slog.Debug("Added MIG pod mapping",
 								"parentUUID", mappingKey,
+								"draMappingKeys", draMappingKeys,
 								"migDevice", migInfo.MIGDeviceUUID,
 								"migProfile", migInfo.Profile,
 								"pod", podContainerKey)
@@ -638,8 +642,16 @@ func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourc
 						}
 
 						podInfo.DynamicResources = &drInfo
-						deviceToPodsMap[mappingKey] = append(deviceToPodsMap[mappingKey], podInfo)
-						processedPods[mappingKey][podContainerKey] = true
+						for _, key := range draMappingKeys {
+							if processedPods[key] == nil {
+								processedPods[key] = make(map[string]bool)
+							}
+							if processedPods[key][podContainerKey] {
+								continue
+							}
+							deviceToPodsMap[key] = append(deviceToPodsMap[key], podInfo)
+							processedPods[key][podContainerKey] = true
+						}
 					}
 				}
 			}
@@ -650,6 +662,29 @@ func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourc
 		"totalMappings", len(deviceToPodsMap),
 		"deviceToPodsMap", fmt.Sprintf("%+v", deviceToPodsMap))
 	return deviceToPodsMap
+}
+
+// draMIGGPUInstanceIdentifier returns the "<gpuIndex>-<gpuInstanceID>" join
+// key that DCGM uses for per-MIG-instance metrics. The MIG GPU-instance ID is
+// not exposed as a DRA device attribute today, so we look it up via NVML using
+// the MIG UUID published by the DRA driver. Returns "" when NVML or
+// deviceInfo are unavailable, or when the MIG UUID cannot be resolved; in
+// that case the caller falls back to the parent-UUID join key only.
+func (p *PodMapper) draMIGGPUInstanceIdentifier(migInfo *DRAMigDeviceInfo, deviceInfo deviceinfo.Provider) string {
+	if migInfo == nil || deviceInfo == nil || migInfo.MIGDeviceUUID == "" {
+		return ""
+	}
+	migDevice, err := nvmlprovider.Client().GetMIGDeviceInfoByID(migInfo.MIGDeviceUUID)
+	if err != nil {
+		slog.Warn("DRA: NVML lookup for MIG device failed; per-MIG metrics will not be enriched with pod labels",
+			"migUUID", migInfo.MIGDeviceUUID, "error", err)
+		return ""
+	}
+	if migDevice.GPUInstanceID < 0 {
+		return ""
+	}
+	return deviceinfo.GetGPUInstanceIdentifier(deviceInfo, migDevice.ParentUUID,
+		uint(migDevice.GPUInstanceID)) //nolint:gosec // G115: bounds checked above
 }
 
 // toDeviceToSharingPods uses the same general logic as toDeviceToPod but
