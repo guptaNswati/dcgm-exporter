@@ -734,6 +734,250 @@ func TestPodDRAInfo(t *testing.T) {
 	}
 }
 
+// TestPodDRAInfo_MIGAddsGPUInstanceMapping covers the MIG fan-out path of
+// toDeviceToPodsDRA: a DRA MIG claim must register the pod under both the
+// parent GPU UUID and DCGM's per-MIG metric key "<gpuIdx>-<gpuInstanceID>".
+// The previous test passes nil deviceInfo, which short-circuits NVML lookup
+// and only exercises the parent-UUID fallback. Without the second key the
+// per-MIG DCGM metrics (DCGM_FI_DEV_*) never receive pod/DRA labels.
+func TestPodDRAInfo_MIGAddsGPUInstanceMapping(t *testing.T) {
+	const (
+		parentUUID    = "GPU-parent-uuid"
+		migUUID       = "MIG-12345"
+		migProfile    = "1g.12gb"
+		gpuInstanceID = 3
+		gpuIndex      = uint(0)
+	)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// NVML resolves a MIG UUID to its parent GPU UUID and instance ID. The
+	// transformation code uses this to construct the "<gpuIdx>-<giID>" key.
+	mockNVML := mocknvmlprovider.NewMockNVML(ctrl)
+	mockNVML.EXPECT().GetMIGDeviceInfoByID(migUUID).Return(&nvmlprovider.MIGDeviceInfo{
+		ParentUUID:    parentUUID,
+		GPUInstanceID: gpuInstanceID,
+	}, nil).AnyTimes()
+	originalNVML := nvmlprovider.Client()
+	defer nvmlprovider.SetClient(originalNVML)
+	nvmlprovider.SetClient(mockNVML)
+
+	// deviceinfo.Provider is walked to find the GPU index whose UUID matches
+	// the parent. We expose a single GPU at index 0 with the matching UUID.
+	mockDeviceInfo := mockdeviceinfo.NewMockProvider(ctrl)
+	mockDeviceInfo.EXPECT().GPUCount().Return(toUint(1)).AnyTimes()
+	mockDeviceInfo.EXPECT().GPU(gpuIndex).Return(deviceinfo.GPUInfo{
+		DeviceInfo: dcgm.Device{UUID: parentUUID, GPU: gpuIndex},
+		MigEnabled: true,
+	}).AnyTimes()
+
+	draMgr := &DRAResourceSliceManager{
+		lookup: func(pool, device string) (string, *DRAMigDeviceInfo) {
+			if pool == "poolA" && device == "gpu-x" {
+				return parentUUID, &DRAMigDeviceInfo{
+					MIGDeviceUUID: migUUID,
+					Profile:       migProfile,
+					ParentUUID:    parentUUID,
+				}
+			}
+			return "", nil
+		},
+	}
+
+	pm := &PodMapper{
+		Config:               &appconfig.Config{NvidiaResourceNames: []string{appconfig.NvidiaResourceName}},
+		ResourceSliceManager: draMgr,
+	}
+
+	resp := &podresourcesapi.ListPodResourcesResponse{
+		PodResources: []*podresourcesapi.PodResources{{
+			Name:      "pod1",
+			Namespace: "ns1",
+			Containers: []*podresourcesapi.ContainerResources{{
+				Name: "ctr1",
+				DynamicResources: []*podresourcesapi.DynamicResource{{
+					ClaimName:      "claim1",
+					ClaimNamespace: "ns1",
+					ClaimResources: []*podresourcesapi.ClaimResource{{
+						DriverName: DRAGPUDriverName,
+						PoolName:   "poolA",
+						DeviceName: "gpu-x",
+					}},
+				}},
+			}},
+		}},
+	}
+
+	got := pm.toDeviceToPodsDRA(resp, mockDeviceInfo)
+
+	// Both keys must be present: the parent UUID (used by parent-GPU metrics)
+	// and the GPU-instance identifier (used by per-MIG metrics).
+	gpuInstanceKey := fmt.Sprintf("%d-%d", gpuIndex, gpuInstanceID)
+	require.Contains(t, got, parentUUID, "parent UUID key must be registered")
+	require.Contains(t, got, gpuInstanceKey, "GPU-instance key %q must be registered for MIG fan-out", gpuInstanceKey)
+	assert.Len(t, got, 2, "exactly two keys expected: parent UUID and GPU-instance identifier")
+
+	for _, key := range []string{parentUUID, gpuInstanceKey} {
+		pis := got[key]
+		require.Len(t, pis, 1, "key %q should resolve to one pod info", key)
+		assert.Equal(t, "pod1", pis[0].Name)
+		assert.Equal(t, "ns1", pis[0].Namespace)
+		assert.Equal(t, "ctr1", pis[0].Container)
+
+		dr := pis[0].DynamicResources
+		require.NotNil(t, dr, "DynamicResources must be set for key %q", key)
+		assert.Equal(t, "claim1", dr.ClaimName)
+		assert.Equal(t, DRAGPUDriverName, dr.DriverName)
+		require.NotNil(t, dr.MIGInfo, "MIGInfo must be set for key %q", key)
+		assert.Equal(t, migUUID, dr.MIGInfo.MIGDeviceUUID)
+		assert.Equal(t, migProfile, dr.MIGInfo.Profile)
+		assert.Equal(t, parentUUID, dr.MIGInfo.ParentUUID)
+	}
+}
+
+// draStaticPodResourcesServer returns a pre-built ListPodResourcesResponse
+// for a single test, used to drive PodMapper.Process end-to-end without
+// depending on JSON sample fixtures.
+type draStaticPodResourcesServer struct {
+	podresourcesapi.UnimplementedPodResourcesListerServer
+	response *podresourcesapi.ListPodResourcesResponse
+}
+
+func (s *draStaticPodResourcesServer) List(
+	_ context.Context, _ *podresourcesapi.ListPodResourcesRequest,
+) (*podresourcesapi.ListPodResourcesResponse, error) {
+	return s.response, nil
+}
+
+// TestProcessPodMapper_DRAEnrichmentForMIGClaim is the end-to-end counterpart
+// of TestPodDRAInfo_MIGAddsGPUInstanceMapping: it runs PodMapper.Process with
+// KubernetesEnableDRA=true and a per-MIG-instance DCGM metric whose
+// GetIDOfType resolves to "0-3", then asserts the enrichment loop attaches
+// pod, namespace, container, dra_*, and dra_mig_* attributes. This proves
+// that the GPU-instance mapping is not only created but actually consumed
+// during metric enrichment.
+func TestProcessPodMapper_DRAEnrichmentForMIGClaim(t *testing.T) {
+	testutils.RequireLinux(t)
+
+	const (
+		parentUUID    = "GPU-parent-uuid"
+		migUUID       = "MIG-12345"
+		migProfile    = "1g.12gb"
+		gpuInstanceID = 3
+		gpuIndex      = uint(0)
+		poolName      = "poolA"
+		deviceName    = "gpu-x"
+	)
+
+	tmpDir, cleanup := testutils.CreateTmpDir(t)
+	defer cleanup()
+	socketPath := tmpDir + "/kubelet.sock"
+
+	server := grpc.NewServer()
+	podresourcesapi.RegisterPodResourcesListerServer(server, &draStaticPodResourcesServer{
+		response: &podresourcesapi.ListPodResourcesResponse{
+			PodResources: []*podresourcesapi.PodResources{{
+				Name:      "pod1",
+				Namespace: "ns1",
+				Containers: []*podresourcesapi.ContainerResources{{
+					Name: "ctr1",
+					DynamicResources: []*podresourcesapi.DynamicResource{{
+						ClaimName:      "claim1",
+						ClaimNamespace: "ns1",
+						ClaimResources: []*podresourcesapi.ClaimResource{{
+							DriverName: DRAGPUDriverName,
+							PoolName:   poolName,
+							DeviceName: deviceName,
+						}},
+					}},
+				}},
+			}},
+		},
+	})
+	cleanupServer := testutils.StartMockServer(t, server, socketPath)
+	defer cleanupServer()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockNVML := mocknvmlprovider.NewMockNVML(ctrl)
+	mockNVML.EXPECT().GetMIGDeviceInfoByID(migUUID).Return(&nvmlprovider.MIGDeviceInfo{
+		ParentUUID:    parentUUID,
+		GPUInstanceID: gpuInstanceID,
+	}, nil).AnyTimes()
+	originalNVML := nvmlprovider.Client()
+	defer nvmlprovider.SetClient(originalNVML)
+	nvmlprovider.SetClient(mockNVML)
+
+	mockDeviceInfo := mockdeviceinfo.NewMockProvider(ctrl)
+	mockDeviceInfo.EXPECT().GPUCount().Return(toUint(1)).AnyTimes()
+	mockDeviceInfo.EXPECT().GPU(gpuIndex).Return(deviceinfo.GPUInfo{
+		DeviceInfo: dcgm.Device{UUID: parentUUID, GPU: gpuIndex},
+		MigEnabled: true,
+	}).AnyTimes()
+
+	// Construct PodMapper directly: NewPodMapper would try to build an
+	// in-cluster client and a real DRAResourceSliceManager, neither of which
+	// are available in unit tests. We inject a stub Lister-backed lookup.
+	pm := &PodMapper{
+		Config: &appconfig.Config{
+			KubernetesGPUIdType:       appconfig.GPUUID,
+			PodResourcesKubeletSocket: socketPath,
+			KubernetesEnableDRA:       true,
+		},
+		ResourceSliceManager: &DRAResourceSliceManager{
+			lookup: func(pool, device string) (string, *DRAMigDeviceInfo) {
+				if pool == poolName && device == deviceName {
+					return parentUUID, &DRAMigDeviceInfo{
+						MIGDeviceUUID: migUUID,
+						Profile:       migProfile,
+						ParentUUID:    parentUUID,
+					}
+				}
+				return "", nil
+			},
+		},
+	}
+
+	// Per-MIG-instance DCGM metric. GetIDOfType returns "<gpu>-<gpuInstanceID>"
+	// when MigProfile is non-empty, which is the key the DRA mapping registers
+	// for MIG claims.
+	counter := counters.Counter{
+		FieldID:   1001,
+		FieldName: "DCGM_FI_DEV_SM_CLOCK",
+		PromType:  "gauge",
+	}
+	metrics := collector.MetricsByCounter{
+		counter: []collector.Metric{{
+			GPU:           fmt.Sprint(gpuIndex),
+			GPUUUID:       parentUUID,
+			GPUInstanceID: fmt.Sprint(gpuInstanceID),
+			MigProfile:    "1g.10gb",
+			Value:         "1440",
+			Counter:       counter,
+			Attributes:    map[string]string{},
+			Labels:        map[string]string{},
+		}},
+	}
+
+	require.NoError(t, pm.Process(metrics, mockDeviceInfo))
+
+	require.Len(t, metrics[counter], 1, "metric should be enriched in place, not fanned out")
+	attrs := metrics[counter][0].Attributes
+
+	assert.Equal(t, "pod1", attrs[podAttribute])
+	assert.Equal(t, "ns1", attrs[namespaceAttribute])
+	assert.Equal(t, "ctr1", attrs[containerAttribute])
+	assert.Equal(t, "claim1", attrs[draClaimName])
+	assert.Equal(t, "ns1", attrs[draClaimNamespace])
+	assert.Equal(t, DRAGPUDriverName, attrs[draDriverName])
+	assert.Equal(t, poolName, attrs[draPoolName])
+	assert.Equal(t, deviceName, attrs[draDeviceName])
+	assert.Equal(t, migProfile, attrs[draMigProfile])
+	assert.Equal(t, migUUID, attrs[draMigDeviceUUID])
+}
+
 func TestProcessPodMapper_WithUID(t *testing.T) {
 	testutils.RequireLinux(t)
 
